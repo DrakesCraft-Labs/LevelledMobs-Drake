@@ -274,7 +274,11 @@ object Utils {
 
         val checkName = if (checkBabyMobs) lmEntity.nameIfBaby else lmEntity.typeName
 
-        for (group in lmEntity.getApplicableGroups()) {
+        // Snapshot once: this runs on the async mob queue thread and the wrapper's group set
+        // can be rebuilt or recycled underneath us mid-iteration (LevelledMobs#545).
+        val applicableGroups = lmEntity.getApplicableGroups().toList()
+
+        for (group in applicableGroups) {
             if (list.excludedGroups.contains(group))
                 return false
         }
@@ -287,7 +291,7 @@ object Utils {
             return false
         }
 
-        for (group in lmEntity.getApplicableGroups()) {
+        for (group in applicableGroups) {
             if (list.includedGroups.contains(group))
                 return true
         }

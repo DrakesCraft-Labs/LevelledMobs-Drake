@@ -51,6 +51,11 @@ import org.bukkit.persistence.PersistentDataType
  */
 class LivingEntityWrapper private constructor() : LivingEntityWrapperBase(), LivingEntityInterface {
     // privates:
+    // Volatile + replaced (never cleared in place): the async mob queue iterates this set
+    // through Utils.isLivingEntityInModalList while the wrapper may be recycled on another
+    // thread. Swapping the reference lets a reader finish on the old set instead of hitting
+    // ConcurrentModificationException. See ArcanePlugins/LevelledMobs#545.
+    @Volatile
     private var applicableGroups: MutableSet<String> = TreeSet(String.CASE_INSENSITIVE_ORDER)
     private var hasCache = false
     private var isClearingData = false
@@ -75,7 +80,11 @@ class LivingEntityWrapper private constructor() : LivingEntityWrapperBase(), Liv
         private set
     var chunkKillcount = 0
     var mobLevel: Int? = null
-    val mobExternalTypes: MutableSet<String> = TreeSet(String.CASE_INSENSITIVE_ORDER)
+    // Volatile + replaced instead of cleared in place, for the same reason as applicableGroups:
+    // RulesManager.isRuleApplicableEntity walks it off the main thread.
+    @Volatile
+    var mobExternalTypes: MutableSet<String> = TreeSet(String.CASE_INSENSITIVE_ORDER)
+        private set
     var rangedDamage: Float? = null
     var attributeValuesCache: MutableMap<Attribute, AttributeInstance>? = null
     val strategyResults = mutableMapOf<StrategyType, Float>()
@@ -180,9 +189,9 @@ class LivingEntityWrapper private constructor() : LivingEntityWrapperBase(), Liv
         this.customStrategyResults.clear()
         this.libsDisguiseCache = null
         this.chunkKillcount = 0
-        applicableGroups.clear()
+        applicableGroups = TreeSet(String.CASE_INSENSITIVE_ORDER)
         applicableRules.clear()
-        mobExternalTypes.clear()
+        mobExternalTypes = TreeSet(String.CASE_INSENSITIVE_ORDER)
         this._spawnedTimeOfDay = null
         this._shouldShowLMNametag = null
         this.spawnReason.clear()
@@ -302,7 +311,7 @@ class LivingEntityWrapper private constructor() : LivingEntityWrapperBase(), Liv
     fun invalidateCache() {
         this.hasCache = false
         this.groupsAreBuilt = false
-        applicableGroups.clear()
+        applicableGroups = TreeSet(String.CASE_INSENSITIVE_ORDER)
         applicableRules.clear()
     }
 

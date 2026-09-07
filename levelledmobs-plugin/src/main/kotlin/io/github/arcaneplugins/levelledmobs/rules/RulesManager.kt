@@ -876,7 +876,8 @@ class RulesManager {
 
         if (ri.conditionsExternalPlugins != null) {
             ExternalCompatibilityManager.updateAllExternalCompats(lmEntity)
-            val mobCompats = lmEntity.mobExternalTypes
+            // Snapshot: updateAllExternalCompats can add to this set from another thread.
+            val mobCompats = lmEntity.mobExternalTypes.toList()
             //if (!lmEntity.isMobOfExternalType) mobCompats.add("NOT-APPLICABLE")
 
             var madeIt = false
