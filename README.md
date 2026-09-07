@@ -1,3 +1,17 @@
+> ### Fork de DrakesCraft — `LevelledMobs-Drake`
+>
+> Fork de [`ArcanePlugins/LevelledMobs`](https://github.com/ArcanePlugins/LevelledMobs)
+> mantenido por [DrakesCraft-Labs](https://github.com/DrakesCraft-Labs) para
+> `mc.drakescraft.cl`. Solo se aplican parches quirurgicos sobre la version
+> publicada; el resto del codigo sigue siendo el del upstream.
+>
+> | Version del fork | Rama | Divergencia respecto al upstream |
+> |---|---|---|
+> | `4.5.3.2 b159-Drake.1` | `fix/cme-modal-list-339` | `ConcurrentModificationException` al recorrer `applicableGroups` y `mobExternalTypes` del `LivingEntityWrapper` desde el hilo asincrono de `MobsQueueManager` ([upstream #545](https://github.com/ArcanePlugins/LevelledMobs/issues/545), [#538](https://github.com/ArcanePlugins/LevelledMobs/issues/538)). Los conjuntos pasan a `@Volatile` y se sustituyen en vez de vaciarse in situ, y los dos recorridos usan una instantanea. Ademas se fija `worldguard-bukkit` a `7.0.17`, la version que corre el servidor, porque el `7.1.0-SNAPSHOT` ya se publica para Java 25 y Gradle lo rechaza contra la cadena de herramientas Java 21 del modulo. |
+>
+> Compilacion: `JAVA_HOME=<jdk21> ./gradlew build -x test` — el jar sale en
+> `levelledmobs-plugin/build/libs/`.
+
 <td style="text-align: center;">
 
 <img src="https://i.ibb.co/ySgMPd0/Levelled-Mobs-Banner-v2-0.png" width="600" height="300" alt="LevelledMobs Banner" />
