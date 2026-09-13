@@ -3,6 +3,7 @@ package io.github.arcaneplugins.levelledmobs.managers
 import java.time.Instant
 import java.util.WeakHashMap
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.atomic.AtomicInteger
 import io.github.arcaneplugins.levelledmobs.LevelledMobs
 import io.github.arcaneplugins.levelledmobs.misc.NametagTimerChecker
 import io.github.arcaneplugins.levelledmobs.misc.QueueItem
@@ -28,8 +29,8 @@ import org.bukkit.scheduler.BukkitTask
  * @since 3.0.0
  */
 class NametagQueueManager {
-    private var isRunning = false
-    private var doThread = false
+    @Volatile private var isRunning = false
+    @Volatile private var doThread = false
     private var nametagSender: NametagSender? = null
     private var hasLibsDisguisesInstalled = false
     var disableNametagJava = false
@@ -38,6 +39,12 @@ class NametagQueueManager {
     private val queue = LinkedBlockingQueue<QueueItem>()
     val nametagSenderHandler = NametagSenderHandler()
     private val queueLock = Any()
+    private val startLock = Any()
+    // bumped on every start(); a worker whose generation is no longer the current one
+    // has been replaced and leaves its loop
+    private val workerGeneration = AtomicInteger()
+    // epoch millis of the worker's last trip around the queue loop
+    @Volatile private var lastWorkerHeartbeat = 0L
 
     fun load(){
         hasLibsDisguisesInstalled = ExternalCompatibilityManager.hasLibsDisguisesInstalled
@@ -62,29 +69,35 @@ class NametagQueueManager {
         doThread = true
         if (LevelledMobs.instance.ver.isRunningFolia) return
 
-        if (isRunning) return
+        synchronized(startLock) {
+            if (isRunning) return
 
-        isRunning = true
+            isRunning = true
+            val generation = workerGeneration.incrementAndGet()
+            lastWorkerHeartbeat = System.currentTimeMillis()
 
-        val scheduler = SchedulerWrapper {
-            var hadError = false
-            try {
-                mainThread()
-            } catch (e: Exception) {
-                if (e !is InterruptedException){
-                    hadError = true
-                    e.printStackTrace()
+            val scheduler = SchedulerWrapper {
+                var hadError = false
+                try {
+                    mainThread(generation)
+                } catch (e: Exception) {
+                    if (e !is InterruptedException){
+                        hadError = true
+                        e.printStackTrace()
+                    }
                 }
-            }
-            if (hadError)
-                Log.sev("Nametag update queue Manager has exited with error")
-            else
-                Log.inf("Nametag update queue Manager has exited")
+                if (hadError)
+                    Log.sev("Nametag update queue Manager has exited with error")
+                else
+                    Log.inf("Nametag update queue Manager has exited")
 
-            isRunning = false
+                // only the current worker owns the flag, otherwise a worker that was
+                // replaced would advertise its live successor as dead
+                if (workerGeneration.get() == generation) isRunning = false
+            }
+            scheduler.run()
+            this.queueTask = scheduler.bukkitTask
         }
-        scheduler.run()
-        this.queueTask = scheduler.bukkitTask
     }
 
     fun stop() {
@@ -93,15 +106,22 @@ class NametagQueueManager {
 
     fun taskChecker(){
         val qt = queueTask ?: return
+        if (!doThread) return
+
+        val stalledForMs = System.currentTimeMillis() - lastWorkerHeartbeat
+
+        // a backlog only means the worker is busy, never that it died. The worker stamps
+        // a heartbeat on every trip around its loop, so that is what decides
+        if (isRunning && !qt.isCancelled && stalledForMs < WORKER_STALL_MS) return
 
         val queueSize = getNumberQueued()
-
-        if (queueSize < 1000 && !qt.isCancelled || Bukkit.getScheduler().isCurrentlyRunning(qt.taskId)) return
         val status = if (qt.isCancelled) "cancelled"
-        else if (queueSize < 1000) "not running"
-        else "queue size was $queueSize"
+        else if (!isRunning) "not running"
+        else "stalled for ${stalledForMs}ms, queue size was $queueSize"
 
         Log.war("Restarting Nametag Queue Manager task, status was $status")
+        // cancel() does not interrupt an async task that is already running; start()
+        // bumps the generation, which is what actually retires the old worker
         qt.cancel()
         isRunning = false
         start()
@@ -136,8 +156,9 @@ class NametagQueueManager {
         return size
     }
 
-    private fun mainThread() {
-        while (doThread) {
+    private fun mainThread(generation: Int) {
+        while (doThread && workerGeneration.get() == generation) {
+            lastWorkerHeartbeat = System.currentTimeMillis()
             val item: QueueItem?
 
             synchronized(queueLock){
@@ -161,7 +182,7 @@ class NametagQueueManager {
             scheduler.run()
         }
 
-        isRunning = false
+        if (workerGeneration.get() == generation) isRunning = false
     }
 
     private fun preProcessItem(item: QueueItem) {
@@ -321,5 +342,11 @@ class NametagQueueManager {
 
     private fun isBedrock(player: Player) : Boolean {
         return player.uniqueId.mostSignificantBits == 0L
+    }
+
+    companion object {
+        // taskChecker runs every 5s, so a worker that has not polled the queue in 30s is
+        // genuinely stuck, not merely busy
+        private const val WORKER_STALL_MS = 30000L
     }
 }

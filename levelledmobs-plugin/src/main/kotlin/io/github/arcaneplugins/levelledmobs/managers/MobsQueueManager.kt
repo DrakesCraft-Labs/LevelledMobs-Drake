@@ -8,6 +8,7 @@ import io.github.arcaneplugins.levelledmobs.misc.EvaluationException
 import io.github.arcaneplugins.levelledmobs.misc.QueueItem
 import io.github.arcaneplugins.levelledmobs.util.Log
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicInteger
 import org.bukkit.Bukkit
@@ -20,15 +21,22 @@ import org.bukkit.scheduler.BukkitTask
  * @since 3.0.0
  */
 class MobsQueueManager {
-    private var isRunning = false
-    private var doThread = false
+    @Volatile private var isRunning = false
+    @Volatile private var doThread = false
     private val queue = LinkedBlockingQueue<QueueItem>()
     private val processingList = mutableListOf<UUID>()
     private val maxThreads = 3
     var ignoreMobsWithNoPlayerContext = false
-    var queueTasks = mutableMapOf<Int, BukkitTask>()
+    var queueTasks: MutableMap<Int, BukkitTask> = ConcurrentHashMap()
     private val threadsCount = AtomicInteger()
     private val queueLock = Any()
+    private val nextWorkerId = AtomicInteger()
+    // bukkit task id -> worker id, so taskChecker can find the worker behind a task
+    private val workerIds = ConcurrentHashMap<Int, Int>()
+    // worker id -> epoch millis of its last trip around the queue loop
+    private val workerHeartbeats = ConcurrentHashMap<Int, Long>()
+    // workers that taskChecker replaced; their loop exits on the next iteration
+    private val retiredWorkers: MutableSet<Int> = ConcurrentHashMap.newKeySet()
 
     fun start() {
         // folia will run directly
@@ -40,6 +48,10 @@ class MobsQueueManager {
         doThread = true
         isRunning = true
         queueTasks.clear()
+        workerIds.clear()
+        workerHeartbeats.clear()
+        retiredWorkers.clear()
+        threadsCount.set(0)
 
         if (!LevelledMobs.instance.ver.isRunningFolia) {
             repeat(
@@ -50,18 +62,31 @@ class MobsQueueManager {
     }
 
     private fun startAThread(){
+        val workerId = nextWorkerId.incrementAndGet()
+        // published before scheduling so a task that never gets to run still looks stale
+        workerHeartbeats[workerId] = System.currentTimeMillis()
+
         val bgThread = Runnable {
             try {
-                mainThread()
+                mainThread(workerId)
             } catch (_: InterruptedException) {
-                isRunning = false
+                // the scheduler is tearing the task down
+            } catch (e: Exception) {
+                Log.sev("Mob processing queue worker exited with error")
+                e.printStackTrace()
+            } finally {
+                // single owner of the thread accounting: every exit path passes here
+                // exactly once, including the ones that throw
+                workerHeartbeats.remove(workerId)
+                retiredWorkers.remove(workerId)
+                doneWithThread()
             }
-            doneWithThread()
         }
 
         threadsCount.getAndIncrement()
         val task = Bukkit.getScheduler().runTaskAsynchronously(LevelledMobs.instance, bgThread)
         queueTasks[task.taskId] = task
+        workerIds[task.taskId] = workerId
     }
 
     fun getNumberQueued(): Int{
@@ -80,11 +105,11 @@ class MobsQueueManager {
     }
 
     private fun doneWithThread(){
-        threadsCount.getAndDecrement()
-        if (threadsCount.get() == 0) {
-            isRunning = false
-            Log.inf("Mob processing queue Manager has exited")
-        }
+        if (threadsCount.decrementAndGet() > 0) return
+
+        threadsCount.set(0)
+        isRunning = false
+        Log.inf("Mob processing queue Manager has exited")
     }
 
     fun stop() {
@@ -92,8 +117,9 @@ class MobsQueueManager {
     }
 
     fun taskChecker(){
-        val queueSize = getNumberQueued()
-        val stopAll = queueSize >= 1000
+        if (!doThread) return
+
+        val now = System.currentTimeMillis()
         var threadsNeeded = 0
         val enumerator = queueTasks.iterator()
 
@@ -101,22 +127,41 @@ class MobsQueueManager {
             val taskEntry = enumerator.next()
             val taskId = taskEntry.key
             val task = taskEntry.value
-            if (!stopAll && (!task.isCancelled || Bukkit.getScheduler().isCurrentlyRunning(taskId))) continue
-            val status = if (task.isCancelled) "cancelled"
-            else if (!stopAll) "not running"
-            else "queue size was $queueSize"
+            val workerId = workerIds[taskId]
+            val lastHeartbeat = if (workerId == null) null else workerHeartbeats[workerId]
+            val stalledForMs = if (lastHeartbeat == null) Long.MAX_VALUE else now - lastHeartbeat
 
-            Log.war("Restarting Nametag Queue Manager task, status was $status")
+            // a backlog only means the workers are busy, never that they died. The worker
+            // stamps a heartbeat on every trip around its loop, so that is what decides
+            if (!task.isCancelled && stalledForMs < WORKER_STALL_MS) continue
+
+            val status = if (task.isCancelled) "cancelled"
+            else if (lastHeartbeat == null) "not running"
+            else "stalled for ${stalledForMs}ms, queue size was ${getNumberQueued()}"
+
+            Log.war("Restarting mob processing queue task, status was $status")
+
+            // cancel() does not interrupt an async task that is already running and
+            // doThread stays true, so the old worker has to be retired explicitly or it
+            // keeps draining the same queue next to its replacement
+            if (workerId != null){
+                retiredWorkers.add(workerId)
+                workerHeartbeats.remove(workerId)
+                workerIds.remove(taskId)
+            }
             task.cancel()
             enumerator.remove()
-            threadsCount.getAndDecrement()
             threadsNeeded++
         }
 
         if (threadsNeeded == 0) return
 
+        // a restart may never push the pool past maxThreads
+        val canStart = threadsNeeded.coerceAtMost(maxThreads - queueTasks.size)
+        if (canStart < 1) return
+
         repeat(
-            threadsNeeded,
+            canStart,
             action = { startAThread() }
         )
     }
@@ -141,8 +186,9 @@ class MobsQueueManager {
         }
     }
 
-    private fun mainThread() {
-        while (doThread) {
+    private fun mainThread(workerId: Int) {
+        while (doThread && !retiredWorkers.contains(workerId)) {
+            workerHeartbeats[workerId] = System.currentTimeMillis()
             val item: QueueItem?
             synchronized(queueLock){
                 item = queue.poll()
@@ -166,7 +212,8 @@ class MobsQueueManager {
             }
         }
 
-        doneWithThread()
+        // the caller's finally block owns doneWithThread(); calling it here too
+        // decremented the counter twice on every clean exit
     }
 
     private fun processItem(item: QueueItem) {
@@ -194,5 +241,11 @@ class MobsQueueManager {
                 "Timed out applying level to mob"
             }
         }
+    }
+
+    companion object {
+        // taskChecker runs every 5s, so a worker that has not polled the queue in 30s is
+        // genuinely stuck, not merely busy
+        private const val WORKER_STALL_MS = 30000L
     }
 }
