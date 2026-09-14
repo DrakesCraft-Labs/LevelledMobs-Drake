@@ -812,6 +812,41 @@ class RulesManager {
         }
     }
 
+    /**
+     * Copia las etiquetas de marcador del mob sin tocar la entidad ni el conjunto vivo.
+     *
+     * `CraftEntity.getScoreboardTags()` devuelve el `Entity.tags` real (un `SizeLimitedSet`
+     * de Guava sobre un `ObjectOpenHashSet` sin sincronizar), no una copia. Recorrerlo o
+     * mutarlo desde el hilo asincrono de nametags rompia por los dos lados: el recorrido
+     * reventaba con NPE de fastutil, y el `add("(none)")` corria contra el
+     * `List.copyOf(entity.getTags())` de `Entity.saveWithoutId`, con lo que la entidad
+     * fallaba al serializar y se perdia al descargar el chunk.
+     *
+     * Ademas el centinela se escribia en la entidad y quedaba persistido en su NBT. Aqui
+     * solo se sustituye en la copia, asi que la condicion `(none)` sigue igualando a los
+     * mobs sin etiquetas sin ensuciar su dato.
+     *
+     * @return copia estable de las etiquetas, o `(none)` si el mob no tiene ninguna.
+     */
+    private fun snapshotScoreboardTags(lmEntity: LivingEntityWrapper): List<String> {
+        var attempt = 0
+        while (true) {
+            try {
+                val copy = ArrayList(lmEntity.livingEntity.scoreboardTags)
+                return if (copy.isEmpty()) NO_SCOREBOARD_TAGS else copy
+            } catch (ex: RuntimeException) {
+                // El conjunto vivo lo muto otro hilo a mitad de la copia (CME o NPE de fastutil).
+                attempt++
+                if (attempt >= SCOREBOARD_TAG_SNAPSHOT_ATTEMPTS) {
+                    DebugManager.log(DebugType.SCOREBOARD_TAGS, lmEntity, false) {
+                        "no se pudo copiar scoreboardTags: ${ex.javaClass.simpleName}"
+                    }
+                    return NO_SCOREBOARD_TAGS
+                }
+            }
+        }
+    }
+
     private fun isRuleApplicableEntity(
         lmEntity: LivingEntityWrapper,
         ri: RuleInfo
@@ -1053,8 +1088,7 @@ class RulesManager {
         }
 
         if (ri.conditionsScoreboardTags != null) {
-            val tags = lmEntity.livingEntity.scoreboardTags
-            if (tags.isEmpty()) tags.add("(none)")
+            val tags = snapshotScoreboardTags(lmEntity)
 
             var madeCriteria = false
             for (tag in tags) {
@@ -1460,6 +1494,12 @@ class RulesManager {
             private set
 
         val ruleLocker = Any()
+
+        /** Centinela de la condicion scoreboard-tags para mobs sin ninguna etiqueta. */
+        private val NO_SCOREBOARD_TAGS: List<String> = listOf("(none)")
+
+        /** Reintentos de copia antes de rendirse ante un mutador concurrente. */
+        private const val SCOREBOARD_TAG_SNAPSHOT_ATTEMPTS = 3
 
         // taken from https://www.baeldung.com/sha-256-hashing-java
         private fun bytesToHex(hash: ByteArray): String {
